@@ -1,15 +1,17 @@
-#ifndef SEWEEX_MEMORY
-#define SEWEEX_MEMORY
+#ifndef SEWEEX_MEMORY_POOL
+#define SEWEEX_MEMORY_POOL
 
 #include <bit>
 #include <list>
+#include <map>
+#include <memory>
 #include <array>
 #include <limits>
+#include <thread>
 #include <variant>
-
-#if !_HAS_CXX20
-	#error "cpp concepts required"
-#endif
+#include <mutex>
+#include <atomic>
+#include <shared_mutex>
 
 namespace Seweex
 {
@@ -164,6 +166,20 @@ namespace Seweex
 			Page& operator=(Page const&) = delete;
 
 			template <class _Ty>
+			_NODISCARD static constexpr float load_of(size_t count) noexcept {
+				constexpr float step = sizeof(_Ty) / static_cast<float>(_Size);
+				return step * count;
+			}
+
+			_NODISCARD static constexpr float max_load() noexcept {
+				return 1;
+			}
+
+			_NODISCARD float load() const noexcept {
+				return myLoad;
+			}
+
+			template <class _Ty>
 			_NODISCARD constexpr Hint fit(size_t count) const noexcept 
 			{
 				if constexpr (alignof(_Ty) <= _Alignment)
@@ -235,6 +251,7 @@ namespace Seweex
 						}
 					}
 
+					myLoad += static_cast<float>(blocks) / blocks_count;
 					iter->make_head(false, blocks);
 
 					auto const offset  = iter - myInfo.begin();
@@ -262,6 +279,7 @@ namespace Seweex
 					auto next    = iter + size;
 					auto farNext = myInfo.end();
 
+					myLoad -= static_cast<float>(size) / blocks_count;
 					iter->make_head(true, size);
 
 					if (next != myInfo.end() && next->is_free()) 
@@ -294,6 +312,128 @@ namespace Seweex
 		private:
 			alignas(_Alignment) storage_type myData = {};
 							    info_type	 myInfo = {};
+								float		 myLoad = 0;
+		};
+
+		template <
+			size_t _Size,
+			size_t _Alignment,
+			Detail::Allocator _AllocTy = std::allocator <Page<_Size, _Alignment>>
+		>
+		class Pool final
+		{
+			using page_type = Page<_Size, _Alignment>;
+
+		public:
+			using allocator_type = typename std::allocator_traits <_AllocTy>::
+								   template rebind_alloc<std::pair<float const, std::unique_ptr<page_type>>>;
+
+		private:
+			void pages_allocating_proc(std::stop_token stop) 
+			{
+				while (!stop.stop_requested())
+				{
+					constexpr auto maxLoad = page_type::max_load();
+
+					float maxPageLoad;
+					float averageLoad;
+
+					{
+						decltype(myPages.begin()) first;
+
+						std::shared_lock lock{ myAllocateMutex };
+
+						first = myPages.begin();
+						maxPageLoad = first != myPages.end() ? first->first : maxLoad;
+					}
+
+					{
+						std::shared_lock lock{ myReserveMutex };
+						averageLoad = myAverageLoadRequest;
+					}
+
+					if (maxPageLoad + averageLoad >= maxLoad)
+						make_pages(1);
+					else
+						std::this_thread::yield();
+				}
+			}
+
+		public:
+			constexpr Pool (allocator_type const& alloc) noexcept :
+				myPages  (alloc),
+				myThread (pages_allocating_proc, this)
+			{}
+
+			constexpr ~Pool() noexcept {
+				myThread.request_stop();
+				myThread.join();
+			}
+
+			void make_pages(size_t count) 
+			{
+				for (size_t i = 0; i < count; ++i)
+				{
+					auto	   page = std::make_unique<page_type>();
+					auto const load = page->load();
+
+					std::unique_lock lock{ myAllocateMutex };
+					
+					myPages.emplace_hint(myPages.begin(), load, std::move(page));
+				}
+			}
+
+			template <class _Ty>
+			_NODISCARD _Ty* occupy(size_t count) noexcept 
+			{
+				auto const load = page_type::load_of<_Ty>(count);
+				_Ty* ptr;
+
+				{
+					std::unique_lock lock{ myAllocateMutex };
+
+					if (!myPages.empty()) 
+					{
+						auto iter = myPages.upper_bound(page_type::max_load() - load);
+
+						if (iter == myPages.begin())
+							ptr = nullptr;
+						
+						else {
+							auto hint = iter;
+							auto node = myPages.extract(--iter);
+
+							auto&	   page = node.mapped();
+							auto const load = page->load();
+
+							ptr = page->try_occupy<_Ty>(count);
+
+							myPages.emplace_hint(++hint, load, std::move(page));
+						}
+					}
+					else
+						ptr = nullptr;
+				}
+
+				{
+					std::unique_lock lock{ myReserveMutex };
+					myAverageLoadRequest = (myAverageLoadRequest * myRequestsCount + load) / ++myRequestsCount;
+				}
+
+				return ptr;
+			}
+
+			// some methods hasn't been realized yet ...
+
+		private:
+			std::multimap <float, std::unique_ptr<page_type>> myPages;
+
+			std::jthread      myThread;
+			std::shared_mutex myAllocateMutex;
+			std::shared_mutex myReserveMutex;
+
+			float  myAverageLoadRequest = 0;
+			size_t myRequestsCount		= 0;
 		};
 	}
 }
